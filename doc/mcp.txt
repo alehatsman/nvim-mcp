@@ -1,0 +1,237 @@
+*mcp.txt*	nvim-mcp: a Model Context Protocol server for Neovim
+
+					Type |gO| to see the table of contents.
+
+==============================================================================
+INTRODUCTION						*nvim-mcp*
+
+nvim-mcp is a plugin that lets AI assistants inspect and edit Neovim buffers
+through a Model Context Protocol (JSON-RPC 2.0) interface.
+
+The server runs as a separate headless Neovim process and communicates with a
+running Neovim instance over a msgpack-RPC socket. It requires no changes to
+the Neovim instance you're editing in beyond a listen address.
+
+==============================================================================
+QUICK START						*mcp-quickstart*
+
+1. Install this plugin so it's on 'runtimepath' for your normal Neovim
+   config (via |vim.pack.add()|, lazy.nvim, or any other plugin manager).
+
+2. Start the Neovim instance you want to edit in with a named listen
+   socket: >
+	nvim --listen /tmp/nvim.sock
+<
+3. In a separate shell, start the MCP server process — an isolated headless
+   Neovim that only needs this plugin on its runtimepath, not your full
+   config.  Pass the target socket via `MCP_SOCKET_PATH` (or rely on `$NVIM`,
+   set automatically when launching from inside `:terminal`): >
+	env MCP_SOCKET_PATH=/tmp/nvim.sock \
+	    nvim --headless -u NONE -U NONE -i NONE -n \
+	         --cmd "set rtp+=/path/to/nvim-mcp" \
+	         --cmd "luafile /path/to/nvim-mcp/scripts/mcp_server_headless.lua"
+<
+   The easiest workflow: open a `:terminal` inside Neovim — `$NVIM` is set
+   automatically, so the socket is discovered without any extra config.
+
+4. Configure your MCP client to run the command from step 3. The server
+   reads newline-delimited JSON from stdin and writes responses to stdout.
+
+==============================================================================
+PROTOCOL						*mcp-protocol*
+
+PROTOCOL VERSION					*mcp-protocol-version*
+
+Current version: `2025-11-25`.  Also supports: `2024-11-05`.
+
+The server negotiates the version in the `initialize` response:
+- If the client's `protocolVersion` is in the supported set, that version is
+  echoed back.
+- Otherwise the server responds with its highest supported version.
+
+HANDSHAKE						*mcp-handshake*
+
+The MCP handshake must complete before any tool/resource/prompt calls: >
+
+  Client → Server:  initialize              (request)
+  Server → Client:  initialize response     (protocolVersion, capabilities)
+  Client → Server:  notifications/initialized  (notification, no response)
+  -- server now accepts all methods --
+<
+Any `tools/call`, `resources/read`, or `prompts/get` sent before
+`notifications/initialized` results in a -32600 InvalidRequest error.
+`ping` is always accepted regardless of state.
+
+TRANSPORT						*mcp-transport*
+
+Messages are newline-delimited JSON (one JSON value per line).  Batch arrays
+(`[{…}, {…}]`) are also accepted and each element is dispatched individually.
+Log output is written to stderr (or a log file); stdout carries only MCP JSON.
+
+SHUTDOWN						*mcp-shutdown*
+
+Shutdown is deterministic — no fixed timeout:
+- A pending-request counter is incremented before each `vim.schedule` call
+  for requests (messages with an `id` field).
+- The counter is decremented after the response is written.
+- When stdin reaches EOF and the counter reaches zero, the process exits.
+
+==============================================================================
+SOCKET ADDRESS						*mcp-socket*
+
+Priority for resolving the Neovim socket:
+
+  1. First non-flag positional argument to `mcp_server_headless.lua`
+  2. `$MCP_SOCKET_PATH` environment variable
+  3. `$NVIM` environment variable (set automatically inside `:terminal`)
+  4. Error — no further auto-discovery
+
+For TCP connections use `host:port` (e.g. `127.0.0.1:6666`).  Any other
+value is treated as a Unix domain socket path.
+
+==============================================================================
+TOOLS							*mcp-tools*
+
+Tools are invoked via `tools/call` with a `name` and `arguments` object.
+
+vim_buffer({buffer?})				*mcp-tool-vim_buffer*
+	Return buffer contents with line numbers.  If `b:mcp_sensitive` is set,
+	only a one-line metadata stub is returned (content is redacted).
+
+vim_command({command})				*mcp-tool-vim_command*
+	Execute an ex-command on the connected Neovim instance.
+	Requires `MCP_ALLOW_COMMANDS=1` (see |MCP_ALLOW_COMMANDS|).
+	The following patterns are rejected (-32602): >
+	  !cmd		  :terminal / :term
+	  :read! / :r!    :write! / :w!
+	  :lua		  :py / :py3 / :python / :python3
+	  system(	  (anywhere in the command string)
+<
+vim_edit({operation, text, …})			*mcp-tool-vim_edit*
+	Edit buffer content.  `operation` is `insert`, `replace`, or
+	`replaceAll`.  Writes are rejected (-32602) if `b:mcp_sensitive` is set.
+
+vim_status({buffer?})				*mcp-tool-vim_status*
+vim_window({action, …})				*mcp-tool-vim_window*
+vim_file_open({filename})			*mcp-tool-vim_file_open*
+vim_buffer_switch({buffer?, filename?})		*mcp-tool-vim_buffer_switch*
+vim_buffer_save({buffer?})			*mcp-tool-vim_buffer_save*
+vim_mark({mark, line, col, buffer?})		*mcp-tool-vim_mark*
+vim_register({register, content})		*mcp-tool-vim_register*
+vim_visual({mode, start_line, …})		*mcp-tool-vim_visual*
+vim_jump({action})				*mcp-tool-vim_jump*
+vim_search({pattern, …})			*mcp-tool-vim_search*
+vim_search_replace({pattern, replacement, …})	*mcp-tool-vim_search_replace*
+vim_grep({pattern, files?})			*mcp-tool-vim_grep*
+vim_macro({action, register?})			*mcp-tool-vim_macro*
+vim_tab({action})				*mcp-tool-vim_tab*
+vim_fold({action, …})				*mcp-tool-vim_fold*
+vim_health()					*mcp-tool-vim_health*
+vim_undo({action, count?})			*mcp-tool-vim_undo*
+	Undo or redo changes in the current buffer.  `action` is `undo` or
+	`redo`.  `count` is the number of steps (default: 1).
+
+vim_quickfix({action})				*mcp-tool-vim_quickfix*
+	Manage the quickfix list.  `action` is `list` (show entries),
+	`next` / `prev` (navigate), or `clear` (empty the list).
+
+vim_option({action, name, value?, scope?})	*mcp-tool-vim_option*
+	Get or set a Vim option.  `action` is `get` or `set`.  `name` is the
+	option name (e.g. `number`, `tabstop`).  `value` is required for
+	`set`.  `scope` is `local` (default) or `global`.
+
+vim_lsp_diagnostics({buffer?, severity?})	*mcp-tool-vim_lsp_diagnostics*
+	Return LSP diagnostics for a buffer as a JSON array.  Each entry
+	contains `severity`, `message`, `lnum`, and `col`.  `severity`
+	filters by level (e.g. `ERROR`, `WARN`).
+
+vim_lsp_hover({line, col, buffer?})		*mcp-tool-vim_lsp_hover*
+	Return LSP hover information at the given position.  `line` is
+	1-indexed, `col` is 0-indexed.
+
+vim_lsp_definition({line, col, buffer?})	*mcp-tool-vim_lsp_definition*
+	Jump to the LSP definition of the symbol at the given position.
+	Returns the file path and line number of the definition.
+
+vim_lsp_references({line, col, buffer?, includeDeclaration?})
+					*mcp-tool-vim_lsp_references*
+	Find all LSP references for the symbol at the given position.
+	`includeDeclaration` defaults to false.
+
+vim_lsp_rename({line, col, new_name, buffer?})	*mcp-tool-vim_lsp_rename*
+	Rename the symbol at the given position via LSP.  `new_name` is the
+	replacement identifier.
+
+==============================================================================
+RESOURCES						*mcp-resources*
+
+nvim://session					*mcp-resource-session*
+	Current buffer contents with line numbers.
+	If `b:mcp_sensitive` is set, returns a metadata stub (no content).
+
+nvim://buffers					*mcp-resource-buffers*
+	JSON array of all loaded buffers: bufnr, name, line_count, modified,
+	filetype.  Sensitive buffers are included with `"sensitive": true`.
+
+==============================================================================
+PROMPTS							*mcp-prompts*
+
+neovim_workflow({task})				*mcp-prompt-neovim_workflow*
+	Returns workflow help for `task`: editing, navigation, search,
+	buffers, windows, or macros.
+
+==============================================================================
+SECURITY						*mcp-security*
+
+b:mcp_sensitive					*b:mcp_sensitive*
+	Set to any truthy value (e.g. `1`) on a buffer to prevent the MCP
+	server from exposing or modifying that buffer's content. >
+
+		:let b:mcp_sensitive = 1
+<
+	- Reads (`vim_buffer`, `nvim://session`) return a metadata stub.
+	- Writes (`vim_edit`) are rejected with -32602.
+	- Grep results (`vim_grep`) replace matched-line text with a
+	  redaction notice.
+	- The buffer still appears in `nvim://buffers` with `"sensitive": true`.
+
+MCP_ALLOW_COMMANDS				*MCP_ALLOW_COMMANDS*
+	The `vim_command` tool is disabled by default because several
+	ex-commands (`:normal`, `:set shell=…`) can be chained to execute
+	arbitrary shell commands.  Set this environment variable to `1` to
+	opt in: >
+
+		env MCP_ALLOW_COMMANDS=1 \
+		    MCP_SOCKET_PATH=/tmp/nvim.sock \
+		    nvim --headless -u NONE -U NONE -i NONE -n \
+		         --cmd "luafile /path/to/scripts/mcp_server_headless.lua"
+<
+	Do not set `MCP_ALLOW_COMMANDS=1` when the Neovim session has access
+	to sensitive files or credentials.
+
+==============================================================================
+ERROR CODES						*mcp-errors*
+
+  -32700  Parse error       Malformed JSON on stdin
+  -32600  Invalid request   Method called before initialization
+  -32601  Method not found  Unknown method / tool / resource / prompt
+  -32602  Invalid params    Missing field, blocked command, sensitive buffer
+  -32603  Internal error    Unexpected error inside a handler
+
+==============================================================================
+ENVIRONMENT VARIABLES					*mcp-env*
+
+  MCP_SOCKET_PATH      Neovim socket (overridden by positional CLI arg)
+  MCP_LOG_LEVEL        TRACE / DEBUG / INFO / WARN / ERROR  (default: INFO)
+  MCP_LOG_FILE         Path to log file (default: stderr)
+  NVIM                 Socket set automatically inside `:terminal`
+  MCP_ALLOW_COMMANDS   Set to `1` to enable the `vim_command` tool (see
+                       |MCP_ALLOW_COMMANDS|)
+
+==============================================================================
+HEALTH CHECK						*mcp-health*
+
+	:checkhealth mcp
+
+==============================================================================
+ vim:tw=78:ts=8:et:ft=help:norl:
